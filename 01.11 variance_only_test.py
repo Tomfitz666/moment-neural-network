@@ -24,7 +24,7 @@ def input_encoder(x):
     x = x.view(x.size(0), -1)   # (B, 784)
 
     mu_ff = x
-    var_ff = x #+ 1e-3           # Poisson-like variance
+    var_ff = x #+ 1e-3           
 
     return mu_ff, var_ff
 # ---------------- data ----------------

@@ -1,155 +1,163 @@
 import torch
 import torch.nn as nn
-from mnn.mnn_core.nn.activation import OriginMnnActivation
+import numpy as np
+from mnn.mnn_core.mnn_utils import Mnn_Core_Func
+from momentactivationtrio import MnnActivateTrio
+
+
 
 class RMNN(nn.Module):
-  
+    
 
-    def __init__(self, N: int, M: int, activation: OriginMnnActivation):
+
+    def __init__(self, N, M):
         super().__init__()
         self.N = N
         self.M = M
-        self.activation = activation
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        self.W = nn.Parameter(torch.randn(N, N,device=self.device) * (1.0 / N) ** 0.5)
-        self.V = nn.Parameter(torch.randn(N, M,device=self.device) * (1.0 / M) ** 0.5)
-
-        self.to(self.device)
-   
-    def compute_sigma_out(self, cov_out):
         
-        if cov_out.dim() == 2:
-            return torch.sqrt(torch.diag(cov_out))
-        else:
-            return torch.sqrt(cov_out)
 
-    # def compute_chi(self, mu_bar, sigma2_bar, sigma_out):
-    #     """
-    #     Computes:
-    #         chi_i = (sigma_bar[i] / sigma_out[i]) * ∂mu_out_i / ∂mu_bar_i
-    #     """
-    #     N = self.N
-
-    #     sigma_bar = torch.sqrt(sigma2_bar)  
-    #     chi = torch.zeros(N, device=mu_bar.device)
-
-    #     # mu_bar must require gradient
-    #     mu_bar_for_grad = mu_bar.clone().detach().requires_grad_(True)
-
-    #     # Run activation to build graph
-    #     mu_out2, _ = self.activation(mu_bar_for_grad, sigma2_bar)
-
-    #     # Compute chi_i for each neuron i
-    #     for i in range(N):
-    #         grad_i = torch.autograd.grad(
-    #             mu_out2[i],              # scalar
-    #             mu_bar_for_grad,         # vector
-    #             retain_graph=True,
-    #             create_graph=False,
-    #             allow_unused=True,
-    #         )[0]
-
-    #         if grad_i is None:
-    #             dphi = 0.0
-    #         else:
-    #             dphi = grad_i[i]
-
-    #         chi[i] = (sigma_bar[i] / sigma_out[i]) * dphi
-
-    #     return chi
-    # 
-
-
-    
-    def forward(self, mu, C, mu_ff, C_ff):
-        mu     = mu.to(self.device)
-        C = C.to(self.device)
-        mu_ff  = mu_ff.to(self.device)
-        C_ff   = C_ff.to(self.device)
-        N = self.N
+        
+       #self.W = nn.Parameter(torch.randn(N, N) * (1.0 / N) ** 0.5)
+        W = torch.randn(N, N) * (1.0 / N) ** 0.5
+        W.fill_diagonal_(2.0)
+        self.W = nn.Parameter(W)
+        self.V = nn.Parameter(torch.randn(N, M) * (1.0 / M) ** 0.5)
 
      
-        mu_bar = self.W @ mu + self.V @ mu_ff               
-        A = self.W @ C                                    
-        Cff_bar = self.V @ C_ff @ self.V.t()                 
-        AW = A * self.W
-        sigma2_bar = AW.sum(dim=1) + torch.diag(Cff_bar)     
-        mu_out, cov_out = self.activation(mu_bar, sigma2_bar)
-       
-        sigma_out = self.compute_sigma_out(cov_out)
-        # chi = self.compute_chi(mu_bar, sigma2_bar, sigma_out)
-        # chi = chi.detach() 
-        # chi_vec = chi.view(N, 1)
+    def forward(self, mu, C, mu_ff, C_ff):
 
-        with torch.no_grad():
-         chi = torch.sqrt(sigma2_bar) / (sigma_out + 1e-8)
-        chi = chi.unsqueeze(-1)
-        B = chi * A
-        C_out = B + B.t() + chi * Cff_bar * chi.t()
-        print("mu_out.grad_fn =", mu_out.grad_fn)
+
+    # ---- mean ----
+        mu_bar = (
+        torch.einsum("ij,bj->bi", self.W, mu)
+      + torch.einsum("ik,bk->bi", self.V, mu_ff)
+    )
+        
+
+    # ---- covariance propagation ----
+        A = torch.einsum("ik,bkj->bij", self.W, C)
+        
+        Cff_bar = torch.einsum("ik,bkl,jl->bij", self.V, C_ff, self.V)
+
+        AW = A * self.W.unsqueeze(0)
+    
+        sigma2_bar = (
+        AW.sum(dim=2)
+      + torch.diagonal(Cff_bar, dim1=1, dim2=2)
+    )
+       
+        sigma2_bar = sigma2_bar.clamp_min(1e-1)
+        
+        
+        
+        mu_out, cov_out, chi = MnnActivateTrio.apply(mu_bar, sigma2_bar)
+
+    
+        s_bar = torch.sqrt(sigma2_bar)
+        s_out = torch.sqrt(cov_out.clamp_min(1e-12))
+        ratio = s_out / (s_bar + 1e-4)
+        ratio = torch.clamp(ratio, max=1e4)
+
+        chi_eff =ratio * chi
+        chi_i = chi_eff            # (B, N)
+        chi_j = chi_eff            # (B, N)
+
+        chi_outer = chi_i.unsqueeze(2) * chi_j.unsqueeze(1)  # (B, N, N)
+        #chi_vec = chi_eff.unsqueeze(-1)  # (B, N, 1)
+
+    # ---- output covariance ----
+        B = chi_eff.unsqueeze(2) * A
+
+        C_out = (
+        B
+      + B.transpose(1, 2)
+      + chi_outer * Cff_bar 
+    )
+
+
+
         return mu_out, C_out
 
 
-class RMNN_VarOnly(nn.Module):
-    """
-    Variance-only Recurrent Moment Neural Network
-    """
-
-    def __init__(self, N: int, M: int):
-        super().__init__()
-        self.N = N
-        self.M = M
-
-        self.activation = OriginMnnActivation()
-
-        # Trainable weights
-        self.W = nn.Parameter(torch.randn(N, N) / N**0.5)
-        self.V = nn.Parameter(torch.randn(N, M) / M**0.5)
-
-    def forward(self, mu, var, mu_ff, var_ff):
-        """
-        mu     : (B, N)
-        var    : (B, N)        # variance only
-        mu_ff  : (B, M)
-        var_ff : (B, M)
-        """
-
-        # ---------- mean propagation ----------
-        mu_bar = (
-            torch.einsum('ij,bj->bi', self.W, mu) +
-            torch.einsum('ij,bj->bi', self.V, mu_ff)
-        )  # (B, N)
-
-        # ---------- variance propagation ----------
-        # Var(Wx) = sum_j W_ij^2 Var(x_j)
-        var_rec = torch.einsum(
-            'ij,bj->bi', self.W**2, var
-        )  # (B, N)
-
-        var_ff_bar = torch.einsum(
-            'ij,bj->bi', self.V**2, var_ff
-        )  # (B, N)
-
-        sigma2_bar = var_rec + var_ff_bar + 1e-8
-
-        # ---------- moment activation ----------
-        mu_out, sigma2_out = self.activation(mu_bar, sigma2_bar)
-
-        return mu_out, sigma2_out
-    
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# N=4
-# M=6    
-# activation=OriginMnnActivation()
-# rmnn = RMNN(N, M, activation).to(device)
-# mu = torch.randn(N)
-# C = torch.randn(N,N); C = C@C.t() + 1e-3*torch.eye(N)
-# mu_ff = torch.randn(M)
-# C_ff = torch.randn(M,M); C_ff = C_ff@C_ff.t() + 1e-3*torch.eye(M)
 
-# mu_out, C_out = rmnn(mu, C, mu_ff, C_ff)
-# print(mu_out)
-# print(C_out)
+
+  
+
+torch.manual_seed(0)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("Using device:", device)
+
+# -----------------------------
+# dimensions
+# -----------------------------
+B = 1    # batch
+N = 128  # recurrent units
+M = 784  # feedforward units
+
+
+model = RMNN(N, M).to(device)
+
+# -----------------------------
+# inputs
+# -----------------------------
+mu = torch.randn(B, N, device=device, requires_grad=True)
+C = torch.randn(B, N, N, device=device)
+C = 0.5 * (C + C.transpose(-1, -2))   # make symmetric
+C.requires_grad_(True)
+
+mu_ff = torch.randn(B, M, device=device, requires_grad=True)
+C_ff = torch.randn(B, M, M, device=device)
+C_ff = 0.5 * (C_ff + C_ff.transpose(-1, -2))
+C_ff.requires_grad_(True)
+
+# -----------------------------
+# forward
+# -----------------------------
+mu_out, C_out = model(mu, C, mu_ff, C_ff)
+
+print("\n=== Forward outputs ===")
+print("mu_out shape:", mu_out.shape)
+print("mu_out sample:\n", mu_out[0])
+
+print("\nC_out shape:", C_out.shape)
+print("C_out[0] symmetry check:",
+      torch.allclose(C_out[0], C_out[0].T, atol=1e-6))
+print("C_out[0] sample:\n", C_out[0])
+
+# -----------------------------
+# loss
+# -----------------------------
+loss = mu_out.mean() + C_out.mean()
+loss.backward()
+
+# -----------------------------
+# gradients
+# -----------------------------
+print("\n=== Gradients ===")
+
+print("mu.grad sample:\n", mu.grad[0])
+print("C.grad sample:\n", C.grad[0])
+
+print("\nW.grad shape:", model.W.grad.shape)
+print("W.grad sample:\n", model.W.grad)
+
+print("\nV.grad shape:", model.V.grad.shape)
+print("V.grad sample:\n", model.V.grad)
+
+# -----------------------------
+# sanity checks
+# -----------------------------
+def finite(x):
+    return torch.isfinite(x).all().item()
+
+print("\n=== Finite checks ===")
+print("mu_out finite:", finite(mu_out))
+print("C_out finite:", finite(C_out))
+print("mu.grad finite:", finite(mu.grad))
+print("C.grad finite:", finite(C.grad))
+print("W.grad finite:", finite(model.W.grad))
+print("V.grad finite:", finite(model.V.grad))
+
+print("\nDemo finished.")

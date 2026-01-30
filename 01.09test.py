@@ -5,50 +5,8 @@ import torch.nn as nn
 from mnn.mnn_core.nn.activation import OriginMnnActivation
 from mnn.mnn_core.nn.criterion import CrossEntropyOnMean
 
-# =========================
-# RMNN (copy your class)
-# =========================
-class RMNN(torch.nn.Module):
-    def __init__(self, N: int, M: int):
-        super().__init__()
-        self.N = N
-        self.M = M
-        self.activation = OriginMnnActivation()
-        self.W = torch.nn.Parameter(torch.randn(N, N) / N**0.5)
-        self.V = torch.nn.Parameter(torch.randn(N, M) / M**0.5)
-
-    def forward(self, mu, C, mu_ff, C_ff):
-        B, N = mu.shape
-
-        mu_bar = (
-            torch.einsum('ij,bj->bi', self.W, mu) +
-            torch.einsum('ij,bj->bi', self.V, mu_ff)
-        )
-
-        A = torch.einsum('ij,bjk->bik', self.W, C)
-        Cff_bar = torch.einsum(
-            'ij,bjk,kl->bil',
-            self.V, C_ff, self.V.T
-        )
-
-        sigma2_bar = (
-            (A * self.W).sum(dim=2) +
-            torch.diagonal(Cff_bar, dim1=1, dim2=2)
-        )
-
-        mu_out, sigma2_out = self.activation(mu_bar, sigma2_bar)
-
-        with torch.no_grad():
-            chi = torch.sqrt(sigma2_bar + 1e-8) / torch.sqrt(sigma2_out + 1e-8)
-        chi = chi.detach()
-
-        Bmat = chi.unsqueeze(2) * A
-        C_out = (
-            Bmat + Bmat.transpose(1, 2) +
-            chi.unsqueeze(2) * Cff_bar * chi.unsqueeze(1)
-        )
-
-        return mu_out, C_out
+from RMNN_model import RMNN
+from BPTT_model import RMNN_BPTT
 
 
 # =========================
@@ -93,26 +51,7 @@ class RMNN(torch.nn.Module):
 # if __name__ == "__main__":
 #     test_rmnn_forward()
 
-class RMNN_BPTT(nn.Module):
-    def __init__(self, rmnn: RMNN, T: int):
-        super().__init__()
-        self.rmnn = rmnn
-        self.T = T
 
-    def forward(self, mu0, C0, mu_ff, C_ff):
-        """
-        mu0   : (B, N)    hidden initial state
-        C0    : (B, N, N)
-        mu_ff : (B, M)    MNIST input
-        C_ff  : (B, M, M)
-        """
-
-        mu, C = mu0, C0
-
-        for _ in range(self.T):
-            mu, C = self.rmnn(mu, C, mu_ff, C_ff)
-
-        return mu, C
 
 def input_encoder(x):
     """
@@ -131,7 +70,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ---------------- hyperparams ----------------
 N = 128        # hidden neurons
 M = 784        # MNIST
-T = 1
+T = 2
 batch_size = 32
 epochs = 3
 
@@ -154,7 +93,7 @@ test_loader = DataLoader(
     shuffle=False
 )
 
-# ===== NEW: evaluation =====
+
 def evaluate(bptt, readout, test_loader, device):
     bptt.eval()
     readout.eval()
@@ -187,7 +126,7 @@ def evaluate(bptt, readout, test_loader, device):
             correct += (pred == y).sum().item()
             total += y.size(0)
 
-            # ===== covariance diagnostics =====
+         
             diag = torch.diagonal(C_T, dim1=1, dim2=2)
             cov_diag_max.append(diag.max().item())
             cov_diag_mean.append(diag.mean().item())
